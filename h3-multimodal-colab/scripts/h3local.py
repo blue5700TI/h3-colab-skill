@@ -257,7 +257,7 @@ def run(args):
     shutil.rmtree(work, ignore_errors=True)
     (work / "out").mkdir(parents=True)
     for j in m["jobs"]:  # the runner reads inputs/<path relative to the manifest>, like on Colab
-        files = list(j.get("inputs", [])) + list(j.get("voices", [])) + [j.get(k) for k in ("first", "last", "extend")]
+        files = list(j.get("inputs", [])) + list(j.get("voices", [])) + [j.get(k) for k in ("first", "last", "extend", "drive_audio")]
         for f in files:
             if f and not str(f).startswith("@") and (base / f).is_file():
                 (work / "inputs" / f).parent.mkdir(parents=True, exist_ok=True)

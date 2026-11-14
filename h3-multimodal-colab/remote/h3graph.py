@@ -176,17 +176,41 @@ def bypass(wf, node_id, port="model"):
     del wf[node_id]
 
 
-def plan_video(job, inputs=(), first=None, last=None, extend=None, rng=None):
+DRIVE_TAG = "\x00DRIVE_AUDIO\x00"
+DRIVE_RE = re.compile(r"<Audio 1>|@(音訊|音频|Audio)\s?1(?!\d)", re.IGNORECASE)
+DRIVE_MAX_SECONDS = 15.0
+DRIVE_REF_PREFIXES = ("ref_images.", "ref_videos.", "ref_video_audios.", "ref_audios.")
+
+
+def plan_video(job, inputs=(), first=None, last=None, extend=None, rng=None, drive=None):
     """Everything about a video job that does not depend on the template.
 
     inputs: media items of `inputs` in manifest order (ref mode). first / last: media items (frames mode).
     extend: None, or {"width", "height", "has_audio", "last_frame": <image media item>} of the source video.
+    drive: None, or the audio media item of `drive_audio` (with "seconds"): the recording is locked into the clip
+           through T8 Audio Conditioning (lock_source) and the picture is generated to match it (lip-sync /
+           singing). In the prompt that recording is <Audio 1>.
     """
     mode = VIDEO_MODES.get(job.get("mode", "ref"))
     if mode is None:
         raise ValueError(f"未知的 mode：{job.get('mode')}")
+    if drive is not None:
+        if drive.get("kind") != "audio":
+            raise ValueError("drive_audio 必須是聲音檔（wav／mp3／flac…）")
+        if extend:
+            raise ValueError("drive_audio 不能和 extend 一起用（延伸影片沿用前一段的聲音）")
+        if mode == "ref" and any(i["kind"] == "audio" for i in inputs):
+            raise ValueError("用 drive_audio 時 inputs 不要再放聲音檔：錄音本身就是 <Audio 1>")
+        if job.get("seconds") is None:
+            if not drive.get("seconds"):
+                raise ValueError("讀不到 drive_audio 的長度，請在 job 裡寫 seconds")
+            job = dict(job, seconds=min(round(float(drive["seconds"]), 3), DRIVE_MAX_SECONDS))
+        if float(job["seconds"]) > DRIVE_MAX_SECONDS + 0.08:
+            raise ValueError(f"drive_audio 一段最長 {DRIVE_MAX_SECONDS:g} 秒；較長的歌請先切段，每段一個 job")
     duration = float(job.get("seconds", 10))
     text = job["prompt"]
+    if drive is not None:  # <Audio 1> / @音訊1 is the locked recording, not one of the inputs
+        text = DRIVE_RE.sub(DRIVE_TAG, text)
     chosen = {"image": [], "video": [], "audio": []}
     if mode == "ref":
         tagged, chosen = resolve_mentions(text, list(inputs))
@@ -218,10 +242,12 @@ def plan_video(job, inputs=(), first=None, last=None, extend=None, rng=None):
     total, low = STEPS["fast" if job.get("fast", True) else "normal"]
     intensity = job.get("intensity", "off")
     unused = [i for i in inputs if i not in chosen[i["kind"]]] if mode == "ref" else []
-    return {"task": task, "mode": mode, "final_prompt": raw_prompt(tagged, task, duration, chosen, bool(extend)),
+    final = raw_prompt(tagged, task, duration, chosen, bool(extend)).replace(DRIVE_TAG, "<Audio 1>")
+    return {"task": task, "mode": mode, "final_prompt": final,
             "chosen": chosen, "seconds": duration, "width": width, "height": height,
             "steps": int(total), "transition_step": int(low), "seed": pick_seed(job.get("seed"), rng),
             "intensity": intensity, "multiplier": INTENSITY.get(intensity), "extend": bool(extend),
+            "drive": drive["name"] if drive else None,
             "unused_inputs": [i["name"] for i in unused]}
 
 
@@ -260,10 +286,52 @@ def video_graph(template, plan, tail_name=None):
             node[slot] = [f"ks{i}", 0]
         wf[N_COND] = {"class_type": "MiniMaxH3ImageToVideo", "inputs": node}
 
+    if plan.get("drive"):  # audio lock: same references / key frames, conditioned by T8 with the recording locked
+        old = wf[N_COND]["inputs"]
+        keep = {k: v for k, v in old.items() if k.startswith(DRIVE_REF_PREFIXES) or k in ("first_frame", "last_frame")}
+        wf["da"] = {"class_type": "LoadAudio", "inputs": {"audio": plan["drive"]}}
+        wf[N_COND] = {"class_type": "MiniMaxH3AudioConditioningT8", "inputs": {
+            "clip": [N_CLIP, 0], "video_vae": [N_VAE, 0], "audio_vae": [N_AVAE, 0], "prompt": plan["final_prompt"],
+            "width": width, "height": height, "length": old["length"], "task_type": plan["task"],
+            "audio_mode": "lock_source", "audio_denoise_strength": 0.0, "add_source_as_reference": True,
+            "prompt_primary_audio_ordinal": 1, "strict_prompt_tags": True, "ref_image_size": "match",
+            "reference_video_policy": "official_2_to_15s", "allow_above_reference_area": True,
+            "drive_audio": ["da", 0], **keep}}
+        wf[N_CREATE]["inputs"]["audio"] = [N_COND, 2]  # mux_audio: the original recording, trimmed to the clip
+        # Sampling = the owner's proven audio-lock route (等級一的我 / 宇宙甜點 MVs): T8 only builds the locked
+        # conditioning; two plain SamplerCustomAdvanced passes do the work. SelfLiftH3Sampler rejects T8's
+        # video+audio noise mask, and T8's own Avatar sampler aborts on 32 GB cards at its VRAM boundary check.
+        lw, lh = drive_low_size(width, height)
+        wf[N_COND]["inputs"].update(width=lw, height=lh)
+        for k in ("ks0", "ks1"):
+            if k in wf:
+                wf[k]["inputs"].update(width=lw, height=lh)
+        s = wf[N_SAMPLER]["inputs"]
+        wf["dg"] = {"class_type": "BasicGuider", "inputs": {"model": s["model"], "conditioning": s["positive"]}}
+        wf["dn"] = {"class_type": "RandomNoise", "inputs": {"noise_seed": plan["seed"]}}
+        wf["dsp"] = {"class_type": "SplitSigmas", "inputs": {"step": plan["transition_step"], "sigmas": s["sigmas"]}}
+        wf["ds1"] = {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["dn", 0], "guider": ["dg", 0],
+                     "sampler": s["sampler"], "sigmas": ["dsp", 0], "latent_image": [N_COND, 1]}}
+        wf["dsep"] = {"class_type": "LTXVSeparateAVLatent", "inputs": {"av_latent": ["ds1", 1]}}
+        wf["dup"] = {"class_type": "MinimaxH3LatentUpscaler3D", "inputs": {"latent": ["dsep", 0],
+                     "model_name": s["upscaler_model"], "mode": "target dimensions", "mode.width": width,
+                     "mode.height": height, "align": 32, "enable_temporal_chunking": True, "force_unload": True,
+                     "device": "cuda", "precision": "fp16"}}
+        wf["dcat"] = {"class_type": "LTXVConcatAVLatent", "inputs": {"video_latent": ["dup", 0], "audio_latent": ["dsep", 1]}}
+        wf["dlock"] = {"class_type": "MiniMaxH3AudioLatentControlT8", "inputs": {"mode": "lock", "strength": 0.0,
+                       "av_latent": ["dcat", 0], "source_audio": ["da", 0], "audio_vae": [N_AVAE, 0]}}
+        wf[N_SAMPLER] = {"class_type": "SamplerCustomAdvanced", "inputs": {"noise": ["dn", 0], "guider": ["dg", 0],
+                         "sampler": s["sampler"], "sigmas": ["dsp", 1], "latent_image": ["dlock", 0]}}
+        for nid, node in wf.items():  # decoders read the denoised output (index 1), not SelfLift's index 0
+            for k, v in node["inputs"].items():
+                if v == [N_SAMPLER, 0]:
+                    node["inputs"][k] = [N_SAMPLER, 1]
+
     wf[N_SECONDS]["inputs"]["value"] = float(plan["seconds"])
     wf[N_SCHED]["inputs"]["steps"] = plan["steps"]
-    wf[N_SAMPLER]["inputs"]["transition_step"] = plan["transition_step"]
-    wf[N_SAMPLER]["inputs"]["seed"] = plan["seed"]
+    if not plan.get("drive"):
+        wf[N_SAMPLER]["inputs"]["transition_step"] = plan["transition_step"]
+        wf[N_SAMPLER]["inputs"]["seed"] = plan["seed"]
 
     if plan["extend"]:  # pin the source tail into the head of the clip, then cut the pinned frames off again
         if not tail_name:
@@ -324,6 +392,118 @@ def picture_graph(template, plan):
     return g
 
 
+# ---------------------------------------------------------------- TTS (32x32 H3, audio only)
+# H3 is least stable in the first ~0.5 s of a clip, and a clip asked to talk from 0.00 s puts the first words exactly
+# there: they get eaten, or a filler syllable ("啊／呀／然後") appears before them. Spare time does the same: the model
+# fills it at the head. The fix (measured 2026-08-31: 10/15 -> 10/10 clean) is a sacrificial lead-in: a harmless
+# sound at the head that we throw away.
+# 2026-11-09: glued to the line ("嗯……最近…") it comes out as a hum running straight into the words, and no level
+# rule can tell hum from speech (cuts landed both in the hum and in the first word). As its own line followed by a
+# written pause it leaves a real silence, and the cut is that silence.
+TTS_LEAD = "嗯。"
+TTS_LEAD_PAUSE = " She pauses for a short silent breath, then continues: "
+TTS_DENSITY = 4.6          # characters per second the line is given (denser = more head-eating)
+TTS_LEAD_SECONDS = 1.0     # lead + the silence after it
+
+D_RE = re.compile(r"<d>\s*\[([^\]]+)\]\s*(.*?)</d>", re.S)
+CHINESE_TAGS = ("mandarin", "chinese", "taiwanese mandarin", "cantonese")
+
+
+def tts_prompt(prompt, lead=True, convert=None):
+    """Dialogue in Simplified Chinese (Traditional is misread more often) and the lead-in as its own line before the
+    first one. convert: a Traditional->Simplified function (OpenCC tw2s) or None. Returns (prompt, dialogue chars)."""
+    first = [True]
+    chars = [0]
+
+    def repl(m):
+        tag, text = m.group(1), m.group(2)
+        if tag.strip().lower() in CHINESE_TAGS and convert:
+            text = convert(text)
+        chars[0] += len(re.sub(r"[\s，。！？、；：,.!?…—「」『』（）()]", "", text))
+        line = f"<d>[{tag}] {text}</d>"
+        if lead and first[0]:
+            line = f"<d>[{tag}] {TTS_LEAD}</d>{TTS_LEAD_PAUSE}" + line
+        first[0] = False
+        return line
+
+    return D_RE.sub(repl, prompt), chars[0]
+
+
+def tts_seconds(chars, given=None, lead=True):
+    """Seconds for a TTS clip: the caller's value, or the dialogue at TTS_DENSITY plus a little air (2–15 s)."""
+    if given:
+        return float(given)
+    return round(min(15.0, max(2.0, chars / TTS_DENSITY + 0.4 + (TTS_LEAD_SECONDS if lead else 0))), 2)
+
+
+def lead_cut(db, hop_s=0.01):
+    """End of the silence after the lead-in, from a level curve (dB per hop).
+
+    The lead is the first stretch of sound lasting >= 0.2 s that starts 0.15–1.2 s in (a click or breath already there
+    at 0.00 s is an onset artifact, measured 2026-11-09: 1 of 15 clips had one); the silence after it must last >= 0.08 s. The cut is 40 ms before the line resumes.
+    None when there is no such pattern (the lead was eaten, or ran into the line): listen to the head."""
+    if len(db) < 20:
+        return None
+    top = sorted(db)[int(len(db) * 0.9)]
+    on = [d > top - 20 for d in db]
+    runs, k = [], 0
+    while k < len(on):                       # (start, end, is_on) runs
+        e = k
+        while e < len(on) and on[e] == on[k]:
+            e += 1
+        runs.append((k, e, on[k])); k = e
+    for n, (s0, e0, is_on) in enumerate(runs):
+        if s0 * hop_s > 1.2:
+            break
+        if is_on and (e0 - s0) * hop_s >= 0.2 and s0 * hop_s >= 0.15:   # a sound already there at 0.00 s is an onset artifact
+            for ps, pe, p_on in runs[n + 1:]:          # the first real pause after the lead
+                if not p_on and (pe - ps) * hop_s >= 0.08 and pe < len(on):
+                    return max(0.0, pe * hop_s - 0.04) if pe * hop_s <= 2.0 else None
+                if p_on and (pe - ps) * hop_s >= 0.5:  # ran into a long phrase without a pause: lead glued on
+                    return None
+            return None
+    return None
+
+
+# ---------------------------------------------------------------- fit file names to what this ComfyUI lists
+def combo_options(spec):
+    """The option list of an /object_info input spec, or None when the input is not a list choice."""
+    if not isinstance(spec, list) or not spec:
+        return None
+    if isinstance(spec[0], list):
+        return spec[0]
+    if spec[0] == "COMBO" and len(spec) > 1 and isinstance(spec[1], dict):
+        return spec[1].get("options")
+    return None
+
+
+def fit_combo_names(g, object_info):
+    """Rewrite model/file names so they match this ComfyUI's own option list, in place.
+
+    Subfolder separators differ between machines and between nodes (one lists `t8_compat/x`, another `H3\\x`), and
+    an agent may "fix" a name into the other form. A name that is not in the list is matched by swapping the
+    separator, then by a unique file name. Returns (changes, still_missing) as lists of strings."""
+    changes, missing = [], []
+    for nid, node in g.items():
+        info = object_info.get(node.get("class_type"), {}).get("input", {})
+        specs = {**info.get("required", {}), **info.get("optional", {})}
+        for key, val in node.get("inputs", {}).items():
+            opts = combo_options(specs.get(key))
+            if not isinstance(val, str) or not opts or val in opts:
+                continue
+            want = val.replace("\\", "/")
+            hit = [o for o in opts if isinstance(o, str) and o.replace("\\", "/") == want]
+            if not hit:
+                name = want.rsplit("/", 1)[-1]
+                hit = [o for o in opts if isinstance(o, str) and o.replace("\\", "/").rsplit("/", 1)[-1] == name]
+            if len(hit) == 1:
+                node["inputs"][key] = hit[0]
+                changes.append(f"{nid}.{key}: {val} -> {hit[0]}")
+            elif any(val.endswith(ext) for ext in (".safetensors", ".pt", ".pth", ".ckpt", ".bin", ".gguf")):
+                missing.append(f"{nid}.{key}: {val}")
+    return changes, missing
+
+
 # ---------------------------------------------------------------- checks (before posting, and on what really ran)
 def check_graph(g):
     """Structural problems of an API graph: forbidden classes, missing class_type, dangling links."""
@@ -346,6 +526,11 @@ def _source(g, link, cls):
     return node if node.get("class_type") == cls else None
 
 
+def drive_low_size(width, height):
+    """Audio lock samples at 2/3 size and lifts x1.5 to the target, like the owner's workflow (multiple of 32)."""
+    return max(32, round(width / 1.5 / 32) * 32), max(32, round(height / 1.5 / 32) * 32)
+
+
 def check_video(g, plan, tail_name=None):
     """Does this graph (built, or read back from /history) really carry the plan?"""
     problems = check_graph(g)
@@ -354,12 +539,22 @@ def check_video(g, plan, tail_name=None):
     cond = g.get(N_COND, {})
     ci = cond.get("inputs", {})
     want_class = "MiniMaxH3ReferenceToVideo" if plan["task"] == "Ref2VA" else "MiniMaxH3ImageToVideo"
+    if plan.get("drive"):
+        want_class = "MiniMaxH3AudioConditioningT8"
+        if ci.get("audio_mode") != "lock_source" or ci.get("task_type") != plan["task"]:
+            problems.append(f"audio lock: mode {ci.get('audio_mode')} / task {ci.get('task_type')} != lock_source / {plan['task']}")
+        src = _source(g, ci.get("drive_audio"), "LoadAudio")
+        if not src or src["inputs"].get("audio") != plan["drive"]:
+            problems.append(f"audio lock: drive_audio does not load {plan['drive']}")
+        if g.get(N_CREATE, {}).get("inputs", {}).get("audio") != [N_COND, 2]:
+            problems.append("audio lock: CreateVideo is not muxed with the locked recording")
     if cond.get("class_type") != want_class:
         problems.append(f"{N_COND} is {cond.get('class_type')}, expected {want_class}")
     if ci.get("prompt") != plan["final_prompt"]:
         problems.append("prompt in the graph differs from the planned prompt")
-    if (ci.get("width"), ci.get("height")) != (plan["width"], plan["height"]):
-        problems.append(f"size {ci.get('width')}x{ci.get('height')} != {plan['width']}x{plan['height']}")
+    size = drive_low_size(plan["width"], plan["height"]) if plan.get("drive") else (plan["width"], plan["height"])
+    if (ci.get("width"), ci.get("height")) != size:
+        problems.append(f"size {ci.get('width')}x{ci.get('height')} != {size[0]}x{size[1]}")
     if plan["task"] == "Ref2VA":
         expect = {"image": ("ref_images.ref_image_", "LoadImage", "image"),
                   "video": ("ref_videos.ref_video_", "GetVideoComponents", None),
@@ -389,14 +584,27 @@ def check_video(g, plan, tail_name=None):
             load = _source(g, scale["inputs"].get("image"), "LoadImage") if scale else None
             if not load or load["inputs"].get("image") != item["name"]:
                 problems.append(f"{slot} does not load {item['name']}")
-            elif (scale["inputs"].get("width"), scale["inputs"].get("height")) != (plan["width"], plan["height"]):
+            elif (scale["inputs"].get("width"), scale["inputs"].get("height")) != size:
                 problems.append(f"{slot} is not scaled to the video size")
     if g.get(N_SECONDS, {}).get("inputs", {}).get("value") != float(plan["seconds"]):
         problems.append(f"seconds node {N_SECONDS} != {plan['seconds']}")
     si = g.get(N_SAMPLER, {}).get("inputs", {})
-    if g.get(N_SCHED, {}).get("inputs", {}).get("steps") != plan["steps"] or si.get("transition_step") != plan["transition_step"]:
+    if plan.get("drive"):
+        low = g.get("dsp", {}).get("inputs", {}).get("step")
+        seed = g.get("dn", {}).get("inputs", {}).get("noise_seed")
+        lock, up = g.get("dlock", {}), g.get("dup", {}).get("inputs", {})
+        if g.get(N_SAMPLER, {}).get("class_type") != "SamplerCustomAdvanced" or si.get("latent_image") != ["dlock", 0]:
+            problems.append("audio lock: the high-res pass does not start from the re-locked latent")
+        if lock.get("class_type") != "MiniMaxH3AudioLatentControlT8" or lock["inputs"].get("mode") != "lock"                 or lock["inputs"].get("source_audio") != ["da", 0]:
+            problems.append("audio lock: the recording is not locked back in after the upscale")
+        if (up.get("mode.width"), up.get("mode.height")) != (plan["width"], plan["height"]):
+            problems.append(f"audio lock: upscale target {up.get('mode.width')}x{up.get('mode.height')} != {plan['width']}x{plan['height']}")
+        model = g.get("dg", {}).get("inputs", {}).get("model")
+    else:
+        low, seed, model = si.get("transition_step"), si.get("seed"), si.get("model")
+    if g.get(N_SCHED, {}).get("inputs", {}).get("steps") != plan["steps"] or low != plan["transition_step"]:
         problems.append(f"steps != {plan['steps']}/{plan['transition_step']}")
-    if si.get("seed") != plan["seed"]:
+    if seed != plan["seed"]:
         problems.append("seed differs")
     for nid in LORAS_DRAMA:
         if nid not in g:
@@ -405,7 +613,7 @@ def check_video(g, plan, tail_name=None):
         if (nid in g) != (plan["multiplier"] is not None):
             problems.append(f"action LoRA {nid} {'missing' if plan['multiplier'] is not None else 'still in the graph with intensity off'}")
     # the model chain must still reach the UNet from the sampler
-    seen, link = set(), si.get("model")
+    seen, link = set(), model
     while is_link(link) and link[0] not in seen:
         seen.add(link[0])
         node = g.get(link[0], {})
@@ -465,7 +673,9 @@ def required_classes(pictures=True, dirs=()):
             ({"mode": "ref", "prompt": "@圖片1 @影片1 @音訊1", "intensity": "mid"},
              {"inputs": [item("image", "a"), item("video", "b"), item("audio", "c")],
               "extend": {"width": 640, "height": 360, "last_frame": item("image", "l")}}, "t"),
-            ({"mode": "frames", "prompt": "x"}, {"first": item("image", "a"), "last": item("image", "b")}, None)):
+            ({"mode": "frames", "prompt": "x"}, {"first": item("image", "a"), "last": item("image", "b")}, None),
+            ({"mode": "ref", "prompt": "@圖片1 <Audio 1>"},
+             {"inputs": [item("image", "a")], "drive": dict(item("audio", "d"), seconds=5.0)}, None)):
         graphs.append(video_graph(t, plan_video(job, **kw), tail))
     if pictures:
         p = plan_picture({"prompt": "x"}, [item("image", "a")])

@@ -43,7 +43,7 @@
      "first": "@frame01", "last": "inputs/end.png",
      "prompt": "...", "seconds": 6, "resolution": "720P"},
 
-    {"id": "line01", "type": "tts", "seconds": 6, "voices": ["inputs/lin_voice.wav"],
+    {"id": "line01", "type": "tts", "voices": ["inputs/lin_voice.wav"],
      "prompt": "subject_definitions:\n<Subject 1> ...\n<Audio 1> is the voice-timbre reference for <Subject 1> (S1). ..."}
   ]
 }
@@ -62,15 +62,17 @@
 | `mode` | video | `ref`（預設）、`frames`、`text` |
 | `first`／`last` | video(frames) | 首格／尾格圖片，至少一張 |
 | `extend` | video(ref) | 前面某個 job 的 `id`（同一批），或一支影片檔路徑 |
-| `seconds` | video、tts | 2–15 |
+| `drive_audio` | video(ref／frames) | 鎖音用的錄音檔（≤ 15 秒）。提示詞裡的 `@音訊1` 就是它；影片長度自動等於錄音長度；成品聲音＝原錄音。不能和 `extend`、`inputs` 裡的聲音檔同時用 |
+| `seconds` | video、tts | 2–15。**TTS 建議不填**：程式依台詞字數自動算（4.6 字／秒＋開頭祭品的時間），多給的秒數會變成開頭的含糊音 |
 | `resolution` | video | `480P`、`720P`、`1080P` |
 | `intensity` | video | `off`（預設）、`low`、`mid`、`high`，判準見 SKILL.md |
 | `fast` | video | `true`（預設，8 步）／`false`（12 步） |
 | `voices` | tts | 參考聲音，≤ 3，對應 `<Audio 1..3>` |
+| `lead_in` | tts | 預設 `true`：自動在第一句前加一句「嗯。」再切掉（見 prompt-guide.md 的 TTS 一節）。只有在你自己已經處理好開頭時才設 `false` |
 | `seed` | 全部 | 不給就隨機；要重現就固定 |
 
 ## 一批的順序與 `@id`
-同一批依序執行。任何檔案欄位（`inputs`、`first`、`last`、`voices`、`extend`）都可以寫 `@<id>`，
+同一批依序執行。任何檔案欄位（`inputs`、`first`、`last`、`voices`、`extend`、`drive_audio`）都可以寫 `@<id>`，
 意思是「**用這一批裡前面那個 job 的成品**」：例如先生 `frame01` 這張圖，再讓 `shot02` 用 `"first": "@frame01"`。
 被引用的 job 一定要排在前面而且成功，否則這一段會失敗（其他段照跑）。
 這樣「分鏡圖 → 影片 → 配音」整條可以一次開機做完。

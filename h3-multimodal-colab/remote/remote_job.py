@@ -65,6 +65,7 @@ NODES = {
     "minimax-h3-audio-t8": "https://github.com/T8mars/comfyui-minimax-h3-audio-T8",
     "comfyui-SelfLift": "https://github.com/facok/comfyui-SelfLift",
     "ComfyUI-H3-Motion-Context": "https://github.com/NikoDemon80/ComfyUI-H3-Motion-Context",
+    "Comfyui_Minimax_h3_latent_Upscaler": "https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler",  # audio lock x1.5 lift
 }
 IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
 VIDEO_EXT = {".mp4", ".mov", ".webm", ".mkv", ".avi"}
@@ -115,7 +116,8 @@ def install():
         log("install: CUDA 13 PyTorch (the int8 ConvRot weights need it)")
         sh([sys.executable, "-m", "pip", "install", "-q", "torch", "torchvision", "torchaudio",
             "--index-url", "https://download.pytorch.org/whl/cu130"])
-    sh([sys.executable, "-m", "pip", "install", "-q", "-r", str(COMFY / "requirements.txt"), "huggingface_hub", "hf_xet"])
+    sh([sys.executable, "-m", "pip", "install", "-q", "-r", str(COMFY / "requirements.txt"), "huggingface_hub", "hf_xet",
+        "opencc-python-reimplemented"])  # TTS: Traditional -> Simplified
     for name, url in NODES.items():
         clone(url, COMFY / "custom_nodes" / name)
     MARK.write_text(time.ctime())
@@ -169,10 +171,29 @@ def call(url, body=None, data=None, headers=None, timeout=120):
     return json.loads(raw) if raw.strip() else {}
 
 
+OBJECT_INFO = {}
+
+
+def fit_names(graph):
+    """Match every model/file name to the spelling this ComfyUI lists (t8_compat/x or a backslash form)."""
+    if not OBJECT_INFO:
+        try:
+            OBJECT_INFO.update(call(COMFY_URL + "/object_info", timeout=120))
+        except Exception as e:
+            log(f"could not read /object_info, names posted as written: {e}")
+            return
+    changes, missing = G.fit_combo_names(graph, OBJECT_INFO)
+    for c in changes:
+        log(f"name fitted to this ComfyUI: {c}")
+    if missing:
+        raise RuntimeError("model file not found in this ComfyUI: " + "; ".join(missing[:6]))
+
+
 def queue(graph):
     problems = G.check_graph(graph)
     if problems:  # never post a graph with a dangling link or a preview/VHS node
         raise RuntimeError("graph check failed before posting: " + "; ".join(problems[:6]))
+    fit_names(graph)
     return call(COMFY_URL + "/prompt", {"prompt": graph, "client_id": "h3skill"})["prompt_id"]
 
 
@@ -264,6 +285,16 @@ def image_size(path):
     return int(s["width"]), int(s["height"])
 
 
+def probe_seconds(path):
+    """Duration of an audio (or any media) file in seconds; 0.0 when it cannot be read."""
+    try:
+        out = subprocess.run([ffmpeg_exe("ffprobe"), "-v", "error", "-show_entries", "format=duration", "-of", "json",
+                              str(path)], capture_output=True, text=True, check=True)
+        return float(json.loads(out.stdout)["format"]["duration"])
+    except (subprocess.CalledProcessError, KeyError, ValueError, FileNotFoundError):
+        return 0.0
+
+
 def probe_video(path):
     """(width, height, has_audio)."""
     try:
@@ -350,6 +381,8 @@ def stage(path, prefix="h3skill"):
             item["width"], item["height"] = image_size(path)
         elif kind == "video":
             item["width"], item["height"], item["has_audio"] = probe_video(path)
+        else:
+            item["seconds"] = probe_seconds(path)
         STAGED[key] = item
     return STAGED[key]
 
@@ -409,6 +442,8 @@ def run_video(j):
     elif mode == "frames":
         kw["first"] = media(j["first"]) if j.get("first") else None
         kw["last"] = media(j["last"]) if j.get("last") else None
+    if j.get("drive_audio"):  # audio lock: the recording drives the clip (lip-sync / singing)
+        kw["drive"] = media(j["drive_audio"])
     plan = G.plan_video(j, **kw)
     if plan["unused_inputs"]:
         log(f"{j['id']}: inputs not mentioned with @圖片N/@影片N/@音訊N are not used: {', '.join(plan['unused_inputs'])}")
@@ -423,7 +458,7 @@ def run_video(j):
     if problems:
         raise RuntimeError("graph check failed before posting: " + "; ".join(problems[:6]))
     pid = queue(graph)
-    log(f"{j['id']}: {plan['task']} {plan['width']}x{plan['height']} {plan['seconds']:g}s queued")
+    log(f"{j['id']}: {plan['task']}{' + audio lock' if plan.get('drive') else ''} {plan['width']}x{plan['height']} {plan['seconds']:g}s queued")
     entry = wait_history(pid, int(j.get("timeout", 2400)), j["id"])
     problems = G.check_video(ran_graph(entry), plan, tail)  # read back the graph ComfyUI really ran
     if problems:
@@ -450,13 +485,40 @@ def run_video(j):
     return clip, info
 
 
+def tw2s():
+    """OpenCC Traditional(Taiwan)->Simplified, or None (the line then goes in as written)."""
+    try:
+        import opencc
+        conv = opencc.OpenCC("tw2s")
+        return conv.convert
+    except Exception as e:
+        log(f"TTS: OpenCC not available ({e}); dialogue is sent as written (Traditional is misread more often)")
+        return None
+
+
+def level_curve(wav, hop_s=0.01):
+    """dB per 10 ms of a 16-bit WAV (mono mix)."""
+    import array, math, wave
+    w = wave.open(str(wav)); ch = w.getnchannels(); sr = w.getframerate()
+    a = array.array("h", w.readframes(w.getnframes())); w.close()
+    hop = int(sr * hop_s) * ch
+    out = []
+    for i in range(0, len(a) - hop, hop):
+        seg = a[i:i + hop]
+        out.append(10 * math.log10(sum(x * x for x in seg) / len(seg) / 32768 ** 2 + 1e-12))
+    return out
+
+
 def run_tts(j):
     """32x32 H3: the picture is thrown away, only the audio latent is decoded (h3_tts32_api.json)."""
     wf = json.loads((JOB / "h3_tts32_api.json").read_text(encoding="utf-8"))
     if os.environ.get("H3JOB_TTS_LORA"):
         wf["63"]["inputs"]["lora_name"] = os.environ["H3JOB_TTS_LORA"]
-    wf["7"]["inputs"]["prompt"] = j["prompt"]
-    wf["56"]["inputs"]["value"] = int(j.get("seconds", 10))
+    lead = j.get("lead_in", True)
+    prompt, chars = G.tts_prompt(j["prompt"], lead=lead, convert=tw2s())
+    seconds = G.tts_seconds(chars, j.get("seconds"), lead)
+    wf["7"]["inputs"]["prompt"] = prompt
+    wf["56"] = {"class_type": "PrimitiveFloat", "inputs": {"value": seconds}}  # half seconds matter: spare time becomes filler
     wf["54"]["inputs"]["seed"] = int(j["seed"]) if j.get("seed") is not None else int.from_bytes(os.urandom(6), "big")
     for k, rel in enumerate(j.get("voices", [])[:3]):  # <Audio N>: voice-timbre references, in order
         src = OUT / STATE["jobs"][rel[1:]]["file"] if rel.startswith("@") else JOB / "inputs" / rel
@@ -464,6 +526,7 @@ def run_tts(j):
         shutil.copy(str(src), str(comfy_input() / name))
         wf[f"ra{k}"] = {"class_type": "LoadAudio", "inputs": {"audio": name}}
         wf["7"]["inputs"][f"ref_audios.ref_audio_{k}"] = [f"ra{k}", 0]
+    fit_names(wf)
     pid = call(COMFY_URL + "/prompt", {"prompt": wf, "client_id": "h3skill"})["prompt_id"]
     t0 = time.time()
     while time.time() - t0 < 900:
@@ -475,10 +538,22 @@ def run_tts(j):
             a = next(o["audio"][0] for o in h["outputs"].values() if o.get("audio"))
             flac = comfy_file(a)
             wav = flac.with_suffix(".wav")
+            info = {"seconds": seconds, "final_prompt": prompt}
             if not shutil.which("ffmpeg"):  # a desktop without ffmpeg: hand over the FLAC as it is
-                return flac, {"seconds": j.get("seconds", 10)}
+                if lead:
+                    info["warning"] = "no ffmpeg: the lead-in 嗯 was not cut off"
+                return flac, info
             sh(["ffmpeg", "-v", "error", "-y", "-i", str(flac), str(wav)])
-            return wav, {"seconds": j.get("seconds", 10)}
+            if lead:
+                cut = G.lead_cut(level_curve(wav))
+                if cut is None:
+                    info["warning"] = "lead-in not found: listen to the first second (head eaten or filler)"
+                else:
+                    raw = wav.with_name(wav.stem + "_raw.wav")
+                    shutil.move(str(wav), str(raw))
+                    sh(["ffmpeg", "-v", "error", "-y", "-ss", f"{cut:.2f}", "-i", str(raw), str(wav)])
+                    info["lead_cut"] = round(cut, 2)
+            return wav, info
         time.sleep(2)
     raise RuntimeError("TTS: no result after 900 s")
 
@@ -510,8 +585,9 @@ def main():
             shutil.copy(str(src), str(dst))
             st.update(status="done", file=dst.name, bytes=dst.stat().st_size, seconds_used=round(time.time() - st["started"], 1),
                       final_prompt=(info.get("final_prompt") or "")[:4000], seed=info.get("seed"))
-            if info.get("warning"):
-                st["warning"] = info["warning"]
+            for key in ("warning", "lead_cut"):
+                if info.get(key) is not None:
+                    st[key] = info[key]
             log(f"{j['id']}: done in {st['seconds_used']} s -> {dst.name}")
         except Exception as e:
             st.update(status="error", error=str(e)[:1500])

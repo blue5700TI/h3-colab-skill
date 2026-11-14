@@ -162,7 +162,7 @@ def load_manifest(path):
             problems.append(f"{jid}：type 要是 {TYPES}")
         if not str(j.get("prompt", "")).strip():
             problems.append(f"{jid}：沒有 prompt")
-        files = list(j.get("inputs", [])) + list(j.get("voices", [])) + [j[k] for k in ("first", "last") if j.get(k)]
+        files = list(j.get("inputs", [])) + list(j.get("voices", [])) + [j[k] for k in ("first", "last", "drive_audio") if j.get(k)]
         if j.get("extend") and j["extend"] not in seen and not str(j["extend"]).startswith("@"):
             files.append(j["extend"])  # not an earlier job in this batch: a video file the user gave
         for f in files:
@@ -231,7 +231,7 @@ def skip_finished(m, base, force):
         for k in ("inputs", "voices"):
             if k in j:
                 j[k] = [swap(v) for v in j[k]]
-        for k in ("first", "last", "extend"):
+        for k in ("first", "last", "extend", "drive_audio"):
             if k in j:
                 j[k] = swap(j[k])
         jobs.append(j)
@@ -303,7 +303,7 @@ def run(args):
         manifest_tmp.write_text(json.dumps(m, ensure_ascii=False, indent=1), encoding="utf-8")
         colab("upload", "-s", session, manifest_tmp, "/content/h3job/manifest.json")
         files = {f for j in m["jobs"] for f in list(j.get("inputs", [])) + list(j.get("voices", []))
-                 + [j[k] for k in ("first", "last", "extend") if j.get(k) and (base / j[k]).is_file()]}
+                 + [j[k] for k in ("first", "last", "extend", "drive_audio") if j.get(k) and (base / j[k]).is_file()]}
         files = {f for f in files if not str(f).startswith("@")}
         dirs = sorted({str(Path(f).parent).replace("\\", "/") for f in files} - {"."})
         if dirs:

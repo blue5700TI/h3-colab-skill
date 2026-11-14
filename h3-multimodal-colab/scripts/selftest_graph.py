@@ -242,6 +242,63 @@ def against_toybox(toybox, rng):
         print(f"  {'identical' if not diff else 'DIFFERENT ' + str(diff)}  {j['id']}")
 
 
+def audio_lock(rng):
+    """drive_audio: T8 lock_source conditioning, <Audio 1> = the recording, seconds from the recording."""
+    song = dict(fake("inputs/song.wav"), seconds=9.42)
+    t = G.load_template(G.VIDEO_TEMPLATE)
+    j = {"id": "sing", "type": "video", "mode": "ref", "prompt": "@圖片1 sings along with <Audio 1>.", "resolution": "480P",
+         "aspect": "9:16"}
+    plan = G.plan_video(j, inputs=[fake("inputs/lin.png")], drive=song, rng=rng)
+    g = G.video_graph(t, plan)
+    ci = g[G.N_COND]["inputs"]
+    expect(g[G.N_COND]["class_type"] == "MiniMaxH3AudioConditioningT8" and ci["audio_mode"] == "lock_source",
+           "audio lock: conditioning is T8 lock_source")
+    expect(plan["seconds"] == 9.42 and g[G.N_SECONDS]["inputs"]["value"] == 9.42, "audio lock: seconds taken from the recording")
+    expect("<Audio 1>" in ci["prompt"] and "<Picture 1>" in ci["prompt"] and "@" not in ci["prompt"],
+           "audio lock: <Audio 1> kept for the recording, picture mention resolved")
+    expect("ref_images.ref_image_0" in ci and not any(k.startswith("ref_audios.") for k in ci), "audio lock: picture ref kept, no audio ref slot")
+    expect(ci["length"] == t[G.N_COND]["inputs"]["length"], "audio lock: frame count still from the seconds node")
+    expect(not G.check_video(g, plan), f"audio lock: {G.check_video(g, plan)}")
+    jf = {"id": "sing2", "type": "video", "mode": "frames", "prompt": "she sings <Audio 1>", "seconds": 6}
+    pf = G.plan_video(jf, first=fake("inputs/end.png"), drive=song, rng=rng)
+    gf = G.video_graph(t, pf)
+    expect(gf[G.N_COND]["inputs"].get("task_type") == "I2VA" and "first_frame" in gf[G.N_COND]["inputs"]
+           and not G.check_video(gf, pf), "audio lock: first-frame I2VA keeps its key frame")
+    # NEG: these must be refused or caught
+    for name, call in (("audio in inputs", lambda: G.plan_video(j, inputs=[fake("inputs/x.wav")], drive=song)),
+                       ("over 15 s", lambda: G.plan_video(dict(j, seconds=20), inputs=[fake("inputs/lin.png")], drive=song)),
+                       ("not audio", lambda: G.plan_video(j, inputs=[], drive=fake("inputs/lin.png"))),
+                       ("with extend", lambda: G.plan_video(j, inputs=[], drive=song, extend={"width": 1, "height": 1,
+                                                                                            "last_frame": fake("l.jpg")}))):
+        try:
+            call()
+            expect(False, f"audio lock NOT REFUSED: {name}")
+        except ValueError:
+            pass
+    bad = copy.deepcopy(g)
+    bad["da"]["inputs"]["audio"] = "other.wav"
+    expect(G.check_video(bad, plan), "audio lock NOT CAUGHT: drive_audio loads another file")
+    lw, lh = G.drive_low_size(plan["width"], plan["height"])
+    expect(ci["width"] == lw and g["dup"]["inputs"]["mode.width"] == plan["width"] and g["dlock"]["inputs"]["source_audio"] == ["da", 0]
+           and g[G.N_SAMPLER]["inputs"]["latent_image"] == ["dlock", 0] and g["dsp"]["inputs"]["step"] == plan["transition_step"],
+           "audio lock: low 2/3 pass -> x1.5 lift -> recording locked back -> high pass")
+    expect(all(v != [G.N_SAMPLER, 0] for n in g.values() for v in n["inputs"].values()), "audio lock: decoders read output 1")
+    bad = copy.deepcopy(g)
+    bad[G.N_SAMPLER]["inputs"]["latent_image"] = ["dcat", 0]
+    expect(G.check_video(bad, plan), "audio lock NOT CAUGHT: recording not re-locked after the upscale")
+    bad = copy.deepcopy(g)
+    bad["dup"]["inputs"]["mode.width"] = lw
+    expect(G.check_video(bad, plan), "audio lock NOT CAUGHT: upscale does not reach the planned size")
+    bad = copy.deepcopy(g)
+    bad["dn"]["inputs"]["noise_seed"] = 1
+    expect(G.check_video(bad, plan), "audio lock NOT CAUGHT: seed differs")
+    bad = copy.deepcopy(g)
+    bad[G.N_CREATE]["inputs"]["audio"] = [G.N_ADECODE, 0]
+    expect(G.check_video(bad, plan), "audio lock NOT CAUGHT: video muxed with generated audio")
+    plain = G.video_graph(t, G.plan_video(dict(j, prompt="@圖片1 walks"), inputs=[fake("inputs/lin.png")], rng=rng))
+    expect(plain[G.N_COND]["class_type"] == "MiniMaxH3ReferenceToVideo", "no drive_audio: graph unchanged")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest")
@@ -263,6 +320,31 @@ def main():
     t, ch = G.resolve_mentions("@圖片2 then @Image1 and @圖片2", [fake("a.png"), fake("b.png")])
     expect(t == "<Picture 1> then <Picture 2> and <Picture 1>" and [c["name"] for c in ch["image"]] ==
            ["h3skill_b_png.png", "h3skill_a_png.png"], "resolve_mentions() order")
+    t, ch = G.resolve_mentions("<Subject 1> is in <Picture 1>; room <Picture 2>", [fake("a.png"), fake("b.png")])
+    expect(len(ch["image"]) == 2, "literal <Picture N> (official guide) keeps its references")
+    expect(G.raw_prompt(G.alignment_line("FL2VA", 4.0) + "\n\nbody", "FL2VA", 4.0, None, False)
+           .count("How the reference pictures align") == 1, "hand-written alignment line is not duplicated")
+    # TTS: lead-in as its own line, Simplified dialogue, seconds from the text, cut after the lead's silence
+    p, n = G.tts_prompt("x <d>[Mandarin] 電鑽，跟阿姨借的。</d> y", True, lambda t: t.replace("電鑽", "电钻"))
+    expect(p.count("<d>") == 2 and "<d>[Mandarin] 嗯。</d>" in p and "电钻" in p and n == 7, "tts_prompt(): lead line + conversion")
+    expect(G.tts_prompt("<d>[English] Hi.</d>", False, None)[0] == "<d>[English] Hi.</d>", "tts_prompt(): lead off, English untouched")
+    expect(G.tts_seconds(7) == round(7 / G.TTS_DENSITY + 0.4 + G.TTS_LEAD_SECONDS, 2) and G.tts_seconds(7, 5) == 5.0, "tts_seconds()")
+    q, l = -60.0, -10.0   # quiet / loud, 10 ms hops
+    head = [l] * 30 + [q] * 25 + [l] * 30 + [q] * 40 + [l] * 150   # 0.3 s sound at 0.00 (as clip n09 had), silence, lead 嗯, silence, the line
+    expect(abs(G.lead_cut(head) - 1.21) < 1e-6, "lead_cut(): onset click skipped, cut after the lead's silence")
+    expect(G.lead_cut([q] * 40 + [l] * 200) is None, "lead_cut(): no lead -> None (NEG)")
+    # model names: fitted to this ComfyUI's own spelling; a file it does not have is reported
+    info = {"Bridge": {"input": {"required": {"model_name": ["COMBO", {"options": ["t8_compat/b.safetensors"]}]}}},
+            "Lora": {"input": {"required": {"lora_name": [["H3\\l.safetensors", "x.safetensors"], {}]}}}}
+    g = {"1": {"class_type": "Bridge", "inputs": {"model_name": "t8_compat\\b.safetensors"}},
+         "2": {"class_type": "Lora", "inputs": {"lora_name": "H3/l.safetensors"}},
+         "3": {"class_type": "Lora", "inputs": {"lora_name": "l.safetensors"}},
+         "4": {"class_type": "Lora", "inputs": {"lora_name": "gone.safetensors"}}}
+    changes, missing = G.fit_combo_names(g, info)
+    expect(g["1"]["inputs"]["model_name"] == "t8_compat/b.safetensors", "backslash name fitted to t8_compat/")
+    expect(g["2"]["inputs"]["lora_name"] == g["3"]["inputs"]["lora_name"] == "H3\\l.safetensors", "name fitted to H3\\")
+    expect(missing == ["4.lora_name: gone.safetensors"], "missing model file reported")
+    audio_lock(rng)
     print()
     if FAILS:
         print("FAILED:\n- " + "\n- ".join(FAILS))
