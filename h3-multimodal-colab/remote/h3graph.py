@@ -31,6 +31,12 @@ STEPS = {"normal": (12, 6), "fast": (8, 4)}
 LORAS_DRAMA = ("53", "400", "404")
 LORAS_ACTION = ("342", "344", "343")
 INTENSITY = {"low": 0.6, "mid": 1.0, "high": 1.3}
+# model_set "official": Comfy-Org's own MiniMax H3 weights instead of the community merge and its turbo LoRA;
+# the MysticXXX LoRA (node 400) stays in the graph at strength 0 so the graph shape is unchanged.
+N_UNET, N_TURBO, N_MYSTIC = "192", "404", "400"
+OFFICIAL = {"unet": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+            "turbo": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"}
+MODEL_SETS = ("default", "official")
 # extension (H3 Motion Context): frames of the source tail pinned into the head of the new clip
 EXTEND = {"context_length": "22", "audio_context_length": 24, "tail_seconds": 3.0}
 # long side of a picture per size key (P-H3 is best at 2K+)
@@ -248,7 +254,15 @@ def plan_video(job, inputs=(), first=None, last=None, extend=None, rng=None, dri
             "steps": int(total), "transition_step": int(low), "seed": pick_seed(job.get("seed"), rng),
             "intensity": intensity, "multiplier": INTENSITY.get(intensity), "extend": bool(extend),
             "drive": drive["name"] if drive else None,
+            "model_set": model_set(job),
             "unused_inputs": [i["name"] for i in unused]}
+
+
+def model_set(job):
+    ms = job.get("model_set", "default")
+    if ms not in MODEL_SETS:
+        raise ValueError(f"model_set 只接受 {MODEL_SETS}")
+    return ms
 
 
 def video_graph(template, plan, tail_name=None):
@@ -357,6 +371,10 @@ def video_graph(template, plan, tail_name=None):
             bypass(wf, node_id)
         else:
             node["inputs"]["strength_model"] = round(node["inputs"]["strength_model"] * mult, 4)
+    if plan.get("model_set") == "official":
+        wf[N_UNET]["inputs"]["unet_name"] = OFFICIAL["unet"]
+        wf[N_TURBO]["inputs"]["lora_name"] = OFFICIAL["turbo"]
+        wf[N_MYSTIC]["inputs"]["strength_model"] = 0.0
     return wf
 
 
@@ -606,6 +624,13 @@ def check_video(g, plan, tail_name=None):
         problems.append(f"steps != {plan['steps']}/{plan['transition_step']}")
     if seed != plan["seed"]:
         problems.append("seed differs")
+    if plan.get("model_set") == "official":
+        if g.get(N_UNET, {}).get("inputs", {}).get("unet_name") != OFFICIAL["unet"]:
+            problems.append("official: UNet is not the Comfy-Org ref2va model")
+        if g.get(N_TURBO, {}).get("inputs", {}).get("lora_name") != OFFICIAL["turbo"]:
+            problems.append("official: turbo LoRA is not the Comfy-Org one")
+        if g.get(N_MYSTIC, {}).get("inputs", {}).get("strength_model") != 0.0:
+            problems.append("official: MysticXXX LoRA strength is not 0")
     for nid in LORAS_DRAMA:
         if nid not in g:
             problems.append(f"drama LoRA {nid} missing")
