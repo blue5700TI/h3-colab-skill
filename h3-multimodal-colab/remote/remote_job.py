@@ -56,6 +56,10 @@ BASE_MODELS = [  # (repo, file in repo, models/ subfolder)
     "semantic_bridge/t8_compat/BUNNY_H3_ActionLogic_Bridge_V1_T8_Compat.safetensors",
     "latent_upscale_models/minimax_h3_latent_upscaler_3d_fp16_V2.safetensors",
 ]]
+OFFICIAL_MODELS = [  # model_set "official" (Comfy-Org): base model and turbo LoRA
+    ("Comfy-Org/MiniMax-H3", "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors", "diffusion_models"),
+    ("Comfy-Org/MiniMax-H3", "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors", "loras"),
+]
 PICTURE_MODELS = [  # P-H3-Image (PrunaAI): a LoRA on the same H3 model + its own encoder and image VAE (~10 GB)
     ("PrunaAI/P-H3-Image-Comfy", "loras/p-h3-image_lora_bf16.safetensors", "loras"),
     ("PrunaAI/P-H3-Image-Comfy", "text_encoders/p-h3-image_text_encoder_int8_convrot.safetensors", "text_encoders"),
@@ -572,7 +576,8 @@ def main():
         install()
         pictures = any(j["type"] == "image" for j in jobs) or manifest.get("install_pictures", False)
         log("models: downloading what is missing", "models")
-        download(BASE_MODELS + (PICTURE_MODELS if pictures else []))
+        official = any(j.get("model_set") == "official" for j in jobs)
+        download(BASE_MODELS + (PICTURE_MODELS if pictures else []) + (OFFICIAL_MODELS if official else []))
         start_comfy()
     STATE["stage"] = "generating"
     for j in jobs:

@@ -45,6 +45,8 @@ SAMPLE = {"jobs": [  # the manifest.md example, plus every mode / intensity / si
     {"id": "shot04", "type": "video", "mode": "first_last", "last": "inputs/end.png", "prompt": "l2v", "seconds": 5, "aspect": "1:1"},
     {"id": "shot05", "type": "video", "mode": "text", "prompt": "empty street at dawn", "seconds": 3, "aspect": "21:9",
      "resolution": "1080P"},
+    {"id": "shot06", "type": "video", "mode": "ref", "prompt": "<Subject 1> is the girl from @圖片1", "inputs": ["inputs/lin.png"],
+     "seconds": 5, "aspect": "16:9", "resolution": "480P", "intensity": "low", "model_set": "official"},
 ]}
 
 
@@ -188,6 +190,8 @@ def broken(rng):
     cases.append(("seconds not written", G.check_video(b, plan)))
     b = copy.deepcopy(g); b[G.N_SCHED]["inputs"]["steps"] = 12
     cases.append(("steps not written", G.check_video(b, plan)))
+    b = copy.deepcopy(g)  # model_set official asked for, but the graph still has the default (community) models
+    cases.append(("model_set official not written", G.check_video(b, dict(plan, model_set="official"))))
     b = copy.deepcopy(pg); del b[G.N_IMG_ENC]["inputs"]["images.image_2"]
     cases.append(("picture edit reference not wired", G.check_picture(b, pplan)))
     for name, probs in cases:
