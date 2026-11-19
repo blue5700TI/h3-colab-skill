@@ -213,6 +213,13 @@ DRIVE_MAX_SECONDS = 15.0
 DRIVE_REF_PREFIXES = ("ref_images.", "ref_videos.", "ref_video_audios.", "ref_audios.")
 
 
+def drive_task(task):
+    """T8 task_type for an audio-locked clip. T8 adds the recording as a reference (add_source_as_reference),
+    so a text-only clip is not T2VA but Ref2VA (its only reference is the recording); T8 refuses T2VA with
+    references. Key-frame modes never get here: plan_video refuses frames + drive_audio (see there)."""
+    return "Ref2VA"
+
+
 def plan_video(job, inputs=(), first=None, last=None, extend=None, rng=None, drive=None):
     """Everything about a video job that does not depend on the template.
 
@@ -230,6 +237,10 @@ def plan_video(job, inputs=(), first=None, last=None, extend=None, rng=None, dri
             raise ValueError("drive_audio 必須是聲音檔（wav／mp3／flac…）")
         if extend:
             raise ValueError("drive_audio 不能和 extend 一起用（延伸影片沿用前一段的聲音）")
+        if mode == "frames":  # 2026-11-20 tested: T8 then needs Hybrid, and the low-res first pass cannot carry the
+            # key frame to full size (SamplerCustomAdvanced: 180 vs 405 tokens). Ref mode with the picture works.
+            raise ValueError("drive_audio 不能用頭尾格（frames）模式：改用 ref 模式，把那張首格圖放進 inputs，"
+                             "提示詞用 @圖片1 指它（人物和構圖會照參考圖走，嘴型跟著錄音）")
         if mode == "ref" and any(i["kind"] == "audio" for i in inputs):
             raise ValueError("用 drive_audio 時 inputs 不要再放聲音檔：錄音本身就是 <Audio 1>")
         if job.get("seconds") is None:
@@ -331,7 +342,7 @@ def video_graph(template, plan, tail_name=None):
         wf["da"] = {"class_type": "LoadAudio", "inputs": {"audio": plan["drive"]}}
         wf[N_COND] = {"class_type": "MiniMaxH3AudioConditioningT8", "inputs": {
             "clip": [N_CLIP, 0], "video_vae": [N_VAE, 0], "audio_vae": [N_AVAE, 0], "prompt": plan["final_prompt"],
-            "width": width, "height": height, "length": old["length"], "task_type": plan["task"],
+            "width": width, "height": height, "length": old["length"], "task_type": drive_task(plan["task"]),
             "audio_mode": "lock_source", "audio_denoise_strength": 0.0, "add_source_as_reference": True,
             "prompt_primary_audio_ordinal": 1, "strict_prompt_tags": True, "ref_image_size": "match",
             "reference_video_policy": "official_2_to_15s", "allow_above_reference_area": True,
@@ -586,8 +597,8 @@ def check_video(g, plan, tail_name=None):
     want_class = "MiniMaxH3ReferenceToVideo" if plan["task"] == "Ref2VA" else "MiniMaxH3ImageToVideo"
     if plan.get("drive"):
         want_class = "MiniMaxH3AudioConditioningT8"
-        if ci.get("audio_mode") != "lock_source" or ci.get("task_type") != plan["task"]:
-            problems.append(f"audio lock: mode {ci.get('audio_mode')} / task {ci.get('task_type')} != lock_source / {plan['task']}")
+        if ci.get("audio_mode") != "lock_source" or ci.get("task_type") != drive_task(plan["task"]):
+            problems.append(f"audio lock: mode {ci.get('audio_mode')} / task {ci.get('task_type')} != lock_source / {drive_task(plan['task'])}")
         src = _source(g, ci.get("drive_audio"), "LoadAudio")
         if not src or src["inputs"].get("audio") != plan["drive"]:
             problems.append(f"audio lock: drive_audio does not load {plan['drive']}")

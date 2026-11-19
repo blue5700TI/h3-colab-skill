@@ -86,6 +86,8 @@ def build(j, rng):
             kw["extend"] = {"width": 1280, "height": 720, "has_audio": True, "last_frame": fake("last_frame.jpg")}
     elif mode == "frames":
         kw = {"first": fake(j["first"]) if j.get("first") else None, "last": fake(j["last"]) if j.get("last") else None}
+    if j.get("drive_audio"):  # audio lock: the recording drives the clip (length faked like every other file)
+        kw["drive"] = dict(fake(j["drive_audio"]), seconds=float(j.get("seconds") or 10.0))
     plan = G.plan_video(j, rng=rng, **kw)
     tail = f"h3skill_tail_{j['id']}.mp4" if plan["extend"] else None
     return plan, G.video_graph(G.load_template(G.VIDEO_TEMPLATE), plan, tail), tail
@@ -108,9 +110,12 @@ def check_job(j, plan, g, tail, template):
     expect(not probs, f"{jid}: {probs}")
     ci = g[G.N_COND]["inputs"]
     expect(g[G.N_SECONDS]["inputs"]["value"] == float(j.get("seconds", 10)), f"{jid}: seconds not in node {G.N_SECONDS}")
-    expect((ci["width"], ci["height"]) == (plan["width"], plan["height"]), f"{jid}: size not in node {G.N_COND}")
-    steps = G.STEPS["fast" if j.get("fast", True) else "normal"]
-    expect((g[G.N_SCHED]["inputs"]["steps"], g[G.N_SAMPLER]["inputs"]["transition_step"]) == steps, f"{jid}: steps")
+    # audio lock conditions a low-res canvas and samples in two plain passes (check_video covers its steps)
+    size = G.drive_low_size(plan["width"], plan["height"]) if plan.get("drive") else (plan["width"], plan["height"])
+    expect((ci["width"], ci["height"]) == size, f"{jid}: size not in node {G.N_COND}")
+    if not plan.get("drive"):
+        steps = G.STEPS["fast" if j.get("fast", True) else "normal"]
+        expect((g[G.N_SCHED]["inputs"]["steps"], g[G.N_SAMPLER]["inputs"]["transition_step"]) == steps, f"{jid}: steps")
     if plan["task"] == "Ref2VA":
         n_img = sum(1 for k in ci if k.startswith("ref_images."))
         expect(n_img == len(plan["chosen"]["image"]), f"{jid}: image ref slots {n_img}")
@@ -271,13 +276,16 @@ def audio_lock(rng):
     expect("ref_images.ref_image_0" in ci and not any(k.startswith("ref_audios.") for k in ci), "audio lock: picture ref kept, no audio ref slot")
     expect(ci["length"] == t[G.N_COND]["inputs"]["length"], "audio lock: frame count still from the seconds node")
     expect(not G.check_video(g, plan), f"audio lock: {G.check_video(g, plan)}")
-    jf = {"id": "sing2", "type": "video", "mode": "frames", "prompt": "she sings <Audio 1>", "seconds": 6}
-    pf = G.plan_video(jf, first=fake("inputs/end.png"), drive=song, rng=rng)
-    gf = G.video_graph(t, pf)
-    expect(gf[G.N_COND]["inputs"].get("task_type") == "I2VA" and "first_frame" in gf[G.N_COND]["inputs"]
-           and not G.check_video(gf, pf), "audio lock: first-frame I2VA keeps its key frame")
+    jt = {"id": "sing3", "type": "video", "mode": "text", "prompt": "a singer on stage, <Audio 1>", "seconds": 6}
+    pt = G.plan_video(jt, drive=song, rng=rng); gt = G.video_graph(t, pt)
+    expect(gt[G.N_COND]["inputs"].get("task_type") == "Ref2VA" and not G.check_video(gt, pt),
+           "audio lock: text-only clip runs as Ref2VA (the recording is its reference)")
+    bad = copy.deepcopy(gt); bad[G.N_COND]["inputs"]["task_type"] = "T2VA"
+    expect(bool(G.check_video(bad, pt)), "audio lock NOT CAUGHT: text-only clip sent to T8 as T2VA")
     # NEG: these must be refused or caught
+    jf = {"id": "sing2", "type": "video", "mode": "frames", "prompt": "she sings <Audio 1>", "seconds": 6}
     for name, call in (("audio in inputs", lambda: G.plan_video(j, inputs=[fake("inputs/x.wav")], drive=song)),
+                       ("frames mode", lambda: G.plan_video(jf, first=fake("inputs/end.png"), drive=song)),
                        ("over 15 s", lambda: G.plan_video(dict(j, seconds=20), inputs=[fake("inputs/lin.png")], drive=song)),
                        ("not audio", lambda: G.plan_video(j, inputs=[], drive=fake("inputs/lin.png"))),
                        ("with extend", lambda: G.plan_video(j, inputs=[], drive=song, extend={"width": 1, "height": 1,

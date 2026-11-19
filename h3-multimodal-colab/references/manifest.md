@@ -62,7 +62,7 @@
 | `mode` | video | `ref`（預設）、`frames`、`text` |
 | `first`／`last` | video(frames) | 首格／尾格圖片，至少一張 |
 | `extend` | video(ref) | 前面某個 job 的 `id`（同一批），或一支影片檔路徑 |
-| `drive_audio` | video(ref／frames) | 鎖音用的錄音檔（≤ 15 秒）。提示詞裡的 `@音訊1` 就是它；影片長度自動等於錄音長度；成品聲音＝原錄音。不能和 `extend`、`inputs` 裡的聲音檔同時用 |
+| `drive_audio` | video（`ref`、`text`；**不能用 `frames`**） | 鎖音用的錄音檔（≤ 15 秒）。提示詞裡的 `@音訊1` 就是它；影片長度自動等於錄音長度；成品聲音＝原錄音。不能和 `extend`、`inputs` 裡的聲音檔同時用。要從一張圖開始鎖音：用 `ref` 模式，把那張圖放進 `inputs`、提示詞用 `@圖片1` 指它 |
 | `seconds` | video、tts | 2–15。**TTS 建議不填**：程式依台詞字數自動算（4.6 字／秒＋開頭祭品的時間），多給的秒數會變成開頭的含糊音 |
 | `resolution` | video | `480P`、`720P`、`1080P` |
 | `intensity` | video | `off`（預設）、`low`、`mid`、`high`，判準見 SKILL.md |
