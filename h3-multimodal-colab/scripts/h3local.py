@@ -6,7 +6,7 @@ and the graphs it posts (remote/h3graph.py + workflows/) are the very same code 
 ComfyUI they talk to is local. Nothing but ComfyUI is needed.
 
   python h3local.py check                      ComfyUI up? models and nodes present? what is missing
-  python h3local.py setup [--with-pictures] [--with-official]
+  python h3local.py setup [--with-pictures] [--with-official | --official-only]
                                                download missing models, clone missing node packs
   python h3local.py run <manifest.json> [--confirmed] [--force]
 
@@ -119,12 +119,23 @@ class Comfy:
         return sys.executable
 
 
-def needed(pictures, official=False):
-    return R.BASE_MODELS + (R.PICTURE_MODELS if pictures else []) + (R.OFFICIAL_MODELS if official else [])
+def needed(pictures, official=False, jobs=None):
+    """jobs given (run): exactly what that batch uses. Otherwise (check／setup): the default set,
+    plus both Comfy-Org families with --with-official, or only those with --official-only."""
+    if jobs is not None:
+        return R.models_for(jobs, pictures)
+    off = R.OFFICIAL_MODELS["ref"] + R.OFFICIAL_MODELS["fl"]
+    if official == "only":
+        return R.COMMON_MODELS + off + (R.PICTURE_MODELS if pictures else [])
+    return R.BASE_MODELS + (R.PICTURE_MODELS if pictures else []) + (off if official else [])
 
 
-def missing_models(c, pictures, official=False):
-    return [(repo, f, folder) for repo, f, folder in needed(pictures, official) if not c.has_model(folder, f)]
+def missing_models(c, pictures, official=False, jobs=None):
+    return [(repo, f, folder) for repo, f, folder in needed(pictures, official, jobs) if not c.has_model(folder, f)]
+
+
+def official_flag(args):
+    return "only" if getattr(args, "official_only", False) else getattr(args, "with_official", False)
 
 
 def missing_nodes(c, pictures=False):
@@ -158,7 +169,7 @@ def check(args, quiet=False):
         print("❌ 找不到 ComfyUI 的資料夾（input／custom_nodes 在哪）：加上 --comfy-dir <ComfyUI 資料夾>")
     if vram and vram < 15:
         print("⚠️ 顯示卡記憶體不到 16 GB：H3 可能跑不動，建議改用 Colab（h3run.py）")
-    miss = missing_models(c, args.with_pictures, args.with_official)
+    miss = missing_models(c, args.with_pictures, official_flag(args), getattr(args, "jobs", None))
     if miss:
         ok = False
         print(f"❌ 少 {len(miss)} 個模型：" + "、".join(Path(f).name for _, f, _ in miss))
@@ -221,7 +232,7 @@ def setup(args):
             if not d.is_dir():
                 git_clone(url, d)
                 new_nodes.append(d)
-    miss = missing_models(c, args.with_pictures, args.with_official)
+    miss = missing_models(c, args.with_pictures, official_flag(args), getattr(args, "jobs", None))
     print(f"② 模型 → {c.models}（缺 {len(miss)} 個）")
     for repo, f, folder in miss:
         print(f"   下載 {Path(f).name}", flush=True)
@@ -250,7 +261,7 @@ def run(args):
         sys.exit("兩支以上的影片：先把上面這行規格給使用者確認，確認後加 --confirmed 再跑")
     pictures = any(j["type"] == "image" for j in m["jobs"])
     args.with_pictures = pictures
-    args.with_official = any(j.get("model_set") == "official" for j in m["jobs"])
+    args.jobs = m["jobs"]  # check only what this batch uses (model_set decides default／official files)
     c, ok = check(args)
     if not ok:
         sys.exit(1)
@@ -315,9 +326,11 @@ def main():
     c = sub.add_parser("check")
     c.add_argument("--with-pictures", action="store_true")
     c.add_argument("--with-official", action="store_true")
+    c.add_argument("--official-only", action="store_true")
     s = sub.add_parser("setup")
     s.add_argument("--with-pictures", action="store_true", help="也下載生圖模型（約多 10 GB）")
-    s.add_argument("--with-official", action="store_true", help="也下載 Comfy-Org 官方主模型和 turbo LoRA（model_set: official，約多 21 GB）")
+    s.add_argument("--with-official", action="store_true", help="也下載 Comfy-Org 官方模型組（model_set: official；Ref2VA＋FL2VA 兩組，約多 48 GB）")
+    s.add_argument("--official-only", action="store_true", help="只用官方模型組：不下載社群主模型、MysticXXX、社群 turbo（不能生圖與配音）")
     r = sub.add_parser("run")
     r.add_argument("manifest")
     r.add_argument("--confirmed", action="store_true")

@@ -149,6 +149,10 @@ def load_manifest(path):
     path = Path(path).resolve()
     m = json.loads(path.read_text(encoding="utf-8"))
     base = path.parent
+    ms = m.get("model_set")  # top-level default for the video jobs (references/official.md)
+    for j in m.get("jobs") or []:
+        if j.get("type") == "video" and ms and "model_set" not in j:
+            j["model_set"] = ms
     jobs, seen, problems = m.get("jobs") or [], set(), []
     if not jobs:
         problems.append("jobs 是空的")
@@ -158,6 +162,8 @@ def load_manifest(path):
             problems.append(f"id 只能用英數、- 和 _：{jid!r}")
         if jid in seen:
             problems.append(f"id 重複：{jid}")
+        if j.get("model_set", "default") not in ("default", "official"):
+            problems.append(f"{jid}：model_set 只能是 default 或 official")
         if j.get("type") not in TYPES:
             problems.append(f"{jid}：type 要是 {TYPES}")
         if not str(j.get("prompt", "")).strip():

@@ -67,7 +67,7 @@
 | `resolution` | video | `480P`、`720P`、`1080P` |
 | `intensity` | video | `off`（預設）、`low`、`mid`、`high`，判準見 SKILL.md |
 | `fast` | video | `true`（預設，8 步）／`false`（12 步） |
-| `model_set` | video | `default`（預設：社群合併主模型＋它的 turbo LoRA＋MysticXXX）／`official`（Comfy-Org 官方 `minimax_h3_ref2va_pruned_int8_convrot`＋`minimax_h3_ref2v_turbo_4step_v0.1`，MysticXXX 強度設 0）。批次裡有 `official` 才多下載約 21 GB |
+| `model_set` | video（也可寫在 manifest 頂層，當整批預設） | `default`（預設：社群客製化組）／`official`（Comfy-Org 官方權重；參考與純文字用 Ref2VA 組、頭尾格用 FL2VA 組，MysticXXX 移除）。換了什麼、下載多少、畫質差異見 `official.md`。整批都是 `official` 時不下載社群主模型 |
 | `voices` | tts | 參考聲音，≤ 3，對應 `<Audio 1..3>` |
 | `lead_in` | tts | 預設 `true`：自動在第一句前加一句「嗯。」再切掉（見 prompt-guide.md 的 TTS 一節）。只有在你自己已經處理好開頭時才設 `false` |
 | `seed` | 全部 | 不給就隨機；要重現就固定 |

@@ -41,25 +41,46 @@ STATE = {"stage": "starting", "log": [], "jobs": {}, "done": False, "error": Non
 TEMPLATE_DIRS = [JOB, Path(__file__).resolve().parent.parent / "workflows"]  # uploaded copies first
 
 ASSETS = "dseditor/minimax-h3-studio-assets"
-BASE_MODELS = [  # (repo, file in repo, models/ subfolder)
-    ("OliviaRossi/Minimax-h3_Singularity-x-10Eros-Max_PRISM", "Minimax-h3_Singularity_x_10Eros-Max_PRISM_int8.safetensors", "diffusion_models"),
+COMMON_MODELS = [  # (repo, file in repo, models/ subfolder): every video/TTS batch, whatever the model set
     ("Comfy-Org/MiniMax-H3", "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", "text_encoders"),
     ("Comfy-Org/MiniMax-H3", "vae/minimax_h3_video_vae_int8_convrot.safetensors", "vae"),
     ("Comfy-Org/MiniMax-H3", "vae/minimax_h3_audio_vae_fp32.safetensors", "vae"),
     ("Comfy-Org/MiniMax-H3", "loras/pika_h3_flex_ref2va_v1_bf16.safetensors", "loras"),  # video + TTS
 ] + [(ASSETS, f, str(Path(f).parent)) for f in [
-    "loras/minimax_h3_turbo_v4_step600_ema_DasiwaREF2VAHybridV1_0_curveproj1025_compat_v001.safetensors",
-    "loras/MysticXXX_MMH3-V2.safetensors",
     "loras/H3_Combat_V2.safetensors",          # motion LoRAs: only wired in when intensity is not "off"
     "loras/Motion_Repair.safetensors",
     "loras/H3_SPEED_slider.safetensors",
     "semantic_bridge/t8_compat/BUNNY_H3_ActionLogic_Bridge_V1_T8_Compat.safetensors",
     "latent_upscale_models/minimax_h3_latent_upscaler_3d_fp16_V2.safetensors",
 ]]
-OFFICIAL_MODELS = [  # model_set "official" (Comfy-Org): base model and turbo LoRA
-    ("Comfy-Org/MiniMax-H3", "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors", "diffusion_models"),
-    ("Comfy-Org/MiniMax-H3", "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors", "loras"),
-]
+COMMUNITY_MODELS = [  # model_set "default": the community merge, its turbo LoRA and MysticXXX (also pictures and TTS)
+    ("OliviaRossi/Minimax-h3_Singularity-x-10Eros-Max_PRISM", "Minimax-h3_Singularity_x_10Eros-Max_PRISM_int8.safetensors", "diffusion_models"),
+] + [(ASSETS, f, str(Path(f).parent)) for f in [
+    "loras/minimax_h3_turbo_v4_step600_ema_DasiwaREF2VAHybridV1_0_curveproj1025_compat_v001.safetensors",
+    "loras/MysticXXX_MMH3-V2.safetensors",
+]]
+BASE_MODELS = COMMUNITY_MODELS[:1] + COMMON_MODELS + COMMUNITY_MODELS[1:]  # what a default batch needs (unchanged)
+OFFICIAL_MODELS = {  # model_set "official" (Comfy-Org), per family: see h3graph.OFFICIAL and references/official.md
+    "ref": [("Comfy-Org/MiniMax-H3", "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors", "diffusion_models"),
+            ("Comfy-Org/MiniMax-H3", "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors", "loras")],
+    "fl": [("Comfy-Org/MiniMax-H3", "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors", "diffusion_models"),
+           ("Comfy-Org/MiniMax-H3", "loras/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors", "loras"),
+           ("Comfy-Org/MiniMax-H3", "loras/pika_h3_flex_fl2va_v1_bf16.safetensors", "loras")],
+}
+
+
+def models_for(jobs, pictures=False):
+    """Exactly the files a batch needs. Image and TTS jobs, and video jobs without model_set "official",
+    need the community set; official video jobs add only the Comfy-Org family they use."""
+    community = any(j["type"] != "video" or j.get("model_set", "default") != "official" for j in jobs) or pictures
+    fams = sorted({G.official_family(j.get("mode", "ref")) for j in jobs
+                   if j["type"] == "video" and j.get("model_set") == "official"})
+    out = COMMON_MODELS + (COMMUNITY_MODELS if community else [])
+    for f in fams:
+        out = out + OFFICIAL_MODELS[f]
+    return out + (PICTURE_MODELS if pictures else [])
+
+
 PICTURE_MODELS = [  # P-H3-Image (PrunaAI): a LoRA on the same H3 model + its own encoder and image VAE (~10 GB)
     ("PrunaAI/P-H3-Image-Comfy", "loras/p-h3-image_lora_bf16.safetensors", "loras"),
     ("PrunaAI/P-H3-Image-Comfy", "text_encoders/p-h3-image_text_encoder_int8_convrot.safetensors", "text_encoders"),
@@ -567,7 +588,7 @@ RUNNERS = {"image": run_image, "video": run_video, "tts": run_tts}
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
-    manifest = json.loads((JOB / "manifest.json").read_text(encoding="utf-8"))
+    manifest = G.apply_model_set(json.loads((JOB / "manifest.json").read_text(encoding="utf-8")))
     jobs = manifest["jobs"]
     for j in jobs:
         STATE["jobs"][j["id"]] = {"type": j["type"], "status": "queued"}
@@ -576,8 +597,7 @@ def main():
         install()
         pictures = any(j["type"] == "image" for j in jobs) or manifest.get("install_pictures", False)
         log("models: downloading what is missing", "models")
-        official = any(j.get("model_set") == "official" for j in jobs)
-        download(BASE_MODELS + (PICTURE_MODELS if pictures else []) + (OFFICIAL_MODELS if official else []))
+        download(models_for(jobs, pictures))
         start_comfy()
     STATE["stage"] = "generating"
     for j in jobs:

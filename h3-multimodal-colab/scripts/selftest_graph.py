@@ -47,6 +47,8 @@ SAMPLE = {"jobs": [  # the manifest.md example, plus every mode / intensity / si
      "resolution": "1080P"},
     {"id": "shot06", "type": "video", "mode": "ref", "prompt": "<Subject 1> is the girl from @圖片1", "inputs": ["inputs/lin.png"],
      "seconds": 5, "aspect": "16:9", "resolution": "480P", "intensity": "low", "model_set": "official"},
+    {"id": "shot07", "type": "video", "mode": "frames", "first": "inputs/lin.png", "prompt": "she turns to the window",
+     "seconds": 5, "aspect": "16:9", "resolution": "480P", "model_set": "official"},
 ]}
 
 
@@ -192,6 +194,12 @@ def broken(rng):
     cases.append(("steps not written", G.check_video(b, plan)))
     b = copy.deepcopy(g)  # model_set official asked for, but the graph still has the default (community) models
     cases.append(("model_set official not written", G.check_video(b, dict(plan, model_set="official"))))
+    # official first-frame clip built with the Ref2VA weights (the family has to follow the task)
+    fplan, fg, _ = build(SAMPLE["jobs"][[x["id"] for x in SAMPLE["jobs"]].index("shot07")], rng)
+    b = copy.deepcopy(fg); b[G.N_UNET]["inputs"]["unet_name"] = G.OFFICIAL["ref"]["unet"]
+    cases.append(("official I2VA given the Ref2VA UNet", G.check_video(b, fplan)))
+    b = copy.deepcopy(fg); b[G.N_TURBO]["inputs"]["lora_name"] = G.OFFICIAL["ref"]["turbo"]
+    cases.append(("official I2VA given the Ref2VA turbo", G.check_video(b, fplan)))
     b = copy.deepcopy(pg); del b[G.N_IMG_ENC]["inputs"]["images.image_2"]
     cases.append(("picture edit reference not wired", G.check_picture(b, pplan)))
     for name, probs in cases:

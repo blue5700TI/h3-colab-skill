@@ -21,13 +21,29 @@ description: Generate pictures, talking videos, video extensions and voice (TTS)
 
 ---
 
-## 0. 第一次使用：先問在哪裡跑
+## 0. 第一次使用：先說花費，再問走哪一條路
 
-**第一件事先問使用者**：「要在 Google Colab 上跑，還是用你自己電腦上的 ComfyUI Desktop（本地）？」
+**先用一兩句話說清楚花費**（細節在下面「Colab 版」第 3 點）：Colab 要 Google AI Pro，L4 約每小時 1.5 點、
+G4 約 11 點；每次開機先下載模型 3–5 分鐘，之後每段影片 L4 約數分鐘。
+
+**說完花費，接著問這一題（這是唯一的分岔點，選了就去讀對應的檔案）**：
+> 「這個技能**預設是一套客製化模型**（社群玩家調過的合併主模型＋加速 LoRA＋風格 LoRA，**著重表現力**：
+> 動作、表情、運鏡比較有戲）。你也可以選：**官方模型**（只用 Comfy-Org 發布的完整 Ref2VA／FL2VA 權重，
+> **著重參考力**：人物會比較像參考照，也適合公開專案、教學、機構），
+> 或是**本地設定**（用你自己電腦的 ComfyUI Desktop，不花 Colab 點數）。要用哪一種？」
+
+| 選擇 | 接下來讀 | manifest 要寫什麼 |
+|---|---|---|
+| **預設：客製化模型**（沒回答就是這個） | 本檔「Colab 版」一節 | 什麼都不用寫 |
+| **官方模型** | `references/official.md`（換了哪些權重、哪些沒換、畫質差在哪） | 頂層加 `"model_set": "official"` |
+| **本地設定** | https://github.com/dseditor/h3-colab-skill/blob/main/localguide.md ＋本檔「本地版」一節 | 同上，本地也可以選官方 |
+
+- 「官方」和「本地」可以疊：本地＋官方＝`h3local.py setup --official-only`，manifest 頂層寫 `official`。
 - 本地要提醒：**ComfyUI Desktop 要先自己安裝好並打開**（https://comfy.org/download），而且需要 NVIDIA 顯示卡、
   16 GB 以上顯示卡記憶體、約 50 GB 硬碟。沒有就用 Colab。
-- 沒回答、或沒有符合條件的顯示卡 → **Colab**。
-- 選了就記住，之後每批照用。使用者中途說「改用本地／改回 Colab」就換。
+- 選了就記住，之後每批照用。使用者中途說「改用官方／改回預設／改用本地／改回 Colab」就換。
+- 兩組不是好壞之分，是**表現力與參考力的取捨**（見 official.md）。使用者沒有明確選，就用預設；
+  但使用者說「人物要像」「不能走樣」「要公開使用」時，可以主動提官方組。
 
 ### 本地版（ComfyUI Desktop）
 完整說明：https://github.com/dseditor/h3-colab-skill/blob/main/localguide.md 。和 Colab 版同一份 manifest、同一套提示詞規則，差別只有：

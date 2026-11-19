@@ -31,12 +31,37 @@ STEPS = {"normal": (12, 6), "fast": (8, 4)}
 LORAS_DRAMA = ("53", "400", "404")
 LORAS_ACTION = ("342", "344", "343")
 INTENSITY = {"low": 0.6, "mid": 1.0, "high": 1.3}
-# model_set "official": Comfy-Org's own MiniMax H3 weights instead of the community merge and its turbo LoRA;
-# the MysticXXX LoRA (node 400) stays in the graph at strength 0 so the graph shape is unchanged.
-N_UNET, N_TURBO, N_MYSTIC = "192", "404", "400"
-OFFICIAL = {"unet": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
-            "turbo": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors"}
+# model_set "official": Comfy-Org's own MiniMax H3 weights instead of the community merge and its turbo LoRA.
+# The weights follow the task (see references/official.md): reference and text clips use the Ref2VA model,
+# first/last-frame clips (I2VA／L2VA／FL2VA) the FL2VA model with its own turbo and flex LoRA.
+# The MysticXXX LoRA (node 400) is bypassed, so an official-only batch never needs that file.
+N_UNET, N_TURBO, N_MYSTIC, N_FLEX = "192", "404", "400", "53"
+OFFICIAL = {
+    "ref": {"unet": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+            "turbo": "minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors",
+            "flex": "pika_h3_flex_ref2va_v1_bf16.safetensors"},
+    "fl": {"unet": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+           "turbo": "minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors",
+           "flex": "pika_h3_flex_fl2va_v1_bf16.safetensors"},
+}
+FL_TASKS = ("FL2VA", "I2VA", "L2VA")
 MODEL_SETS = ("default", "official")
+
+
+def official_family(task_or_mode):
+    """'fl' for first/last-frame clips, else 'ref' (Ref2VA and text-only clips)."""
+    return "fl" if task_or_mode in FL_TASKS or task_or_mode == "frames" else "ref"
+
+
+def apply_model_set(manifest):
+    """A top-level "model_set" is the default for every video job that does not set its own. Returns the manifest."""
+    top = manifest.get("model_set")
+    if top is not None and top not in MODEL_SETS:
+        raise ValueError(f"model_set 只接受 {MODEL_SETS}")
+    for j in manifest.get("jobs", []):
+        if j.get("type") == "video" and top and "model_set" not in j:
+            j["model_set"] = top
+    return manifest
 # extension (H3 Motion Context): frames of the source tail pinned into the head of the new clip
 EXTEND = {"context_length": "22", "audio_context_length": 24, "tail_seconds": 3.0}
 # long side of a picture per size key (P-H3 is best at 2K+)
@@ -372,9 +397,11 @@ def video_graph(template, plan, tail_name=None):
         else:
             node["inputs"]["strength_model"] = round(node["inputs"]["strength_model"] * mult, 4)
     if plan.get("model_set") == "official":
-        wf[N_UNET]["inputs"]["unet_name"] = OFFICIAL["unet"]
-        wf[N_TURBO]["inputs"]["lora_name"] = OFFICIAL["turbo"]
-        wf[N_MYSTIC]["inputs"]["strength_model"] = 0.0
+        o = OFFICIAL[official_family(plan["task"])]
+        wf[N_UNET]["inputs"]["unet_name"] = o["unet"]
+        wf[N_TURBO]["inputs"]["lora_name"] = o["turbo"]
+        wf[N_FLEX]["inputs"]["lora_name"] = o["flex"]
+        bypass(wf, N_MYSTIC)
     return wf
 
 
@@ -624,15 +651,17 @@ def check_video(g, plan, tail_name=None):
         problems.append(f"steps != {plan['steps']}/{plan['transition_step']}")
     if seed != plan["seed"]:
         problems.append("seed differs")
-    if plan.get("model_set") == "official":
-        if g.get(N_UNET, {}).get("inputs", {}).get("unet_name") != OFFICIAL["unet"]:
-            problems.append("official: UNet is not the Comfy-Org ref2va model")
-        if g.get(N_TURBO, {}).get("inputs", {}).get("lora_name") != OFFICIAL["turbo"]:
-            problems.append("official: turbo LoRA is not the Comfy-Org one")
-        if g.get(N_MYSTIC, {}).get("inputs", {}).get("strength_model") != 0.0:
-            problems.append("official: MysticXXX LoRA strength is not 0")
+    official = plan.get("model_set") == "official"
+    if official:
+        fam = official_family(plan["task"]); o = OFFICIAL[fam]
+        for nid, key, what in ((N_UNET, "unet_name", "UNet"), (N_TURBO, "lora_name", "turbo LoRA"), (N_FLEX, "lora_name", "flex LoRA")):
+            got = g.get(nid, {}).get("inputs", {}).get(key)
+            if got != o[{"UNet": "unet", "turbo LoRA": "turbo", "flex LoRA": "flex"}[what]]:
+                problems.append(f"official ({fam}): {what} is {got}, not the Comfy-Org {fam} one")
+        if N_MYSTIC in g:
+            problems.append("official: MysticXXX LoRA is still in the graph")
     for nid in LORAS_DRAMA:
-        if nid not in g:
+        if nid not in g and not (official and nid == N_MYSTIC):
             problems.append(f"drama LoRA {nid} missing")
     for nid in LORAS_ACTION:
         if (nid in g) != (plan["multiplier"] is not None):
