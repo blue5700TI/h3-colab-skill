@@ -5,8 +5,8 @@ No Colab, no colab-cli, no GPU to rent or release, no 15-minute keep. The job ru
 and the graphs it posts (remote/h3graph.py + workflows/) are the very same code the Colab mode uses; only the
 ComfyUI they talk to is local. Nothing but ComfyUI is needed.
 
-  python h3local.py check                      ComfyUI up? models and nodes present? what is missing
-  python h3local.py setup [--with-pictures] [--with-official | --official-only]
+  python h3local.py check [--manifest <manifest.json>]    ComfyUI up? models and nodes present? what is missing
+  python h3local.py setup [--manifest <manifest.json>] [--with-pictures] [--with-official | --official-only]
                                                download missing models, clone missing node packs
   python h3local.py run <manifest.json> [--confirmed] [--force]
 
@@ -120,13 +120,13 @@ class Comfy:
 
 
 def needed(pictures, official=False, jobs=None):
-    """jobs given (run): exactly what that batch uses. Otherwise (check／setup): the default set,
+    """jobs given (run or --manifest): select the batch's models. Otherwise: the default set,
     plus both Comfy-Org families with --with-official, or only those with --official-only."""
     if jobs is not None:
         return R.models_for(jobs, pictures)
     off = R.OFFICIAL_MODELS["ref"] + R.OFFICIAL_MODELS["fl"]
     if official == "only":
-        return R.COMMON_MODELS + off + (R.PICTURE_MODELS if pictures else [])
+        return R.SHARED_ENCODER + R.COMMON_MODELS + off + (R.PICTURE_MODELS if pictures else [])
     return R.BASE_MODELS + (R.PICTURE_MODELS if pictures else []) + (off if official else [])
 
 
@@ -138,19 +138,30 @@ def official_flag(args):
     return "only" if getattr(args, "official_only", False) else getattr(args, "with_official", False)
 
 
-def missing_nodes(c, pictures=False):
-    """Every node class a run will post must be known to this ComfyUI: the clean templates in workflows/
-    plus the nodes h3graph.py adds (reference loaders, Motion Context, image-to-video, the picture graph when
-    pictures are wanted), plus the TTS graph. Missing core nodes mean ComfyUI is too old; missing others mean
-    a node pack is not installed (or ComfyUI was not restarted)."""
+def node_kinds(jobs, pictures):
+    if not jobs:
+        return ("image", "video", "tts") if pictures else ("video", "tts")
+    kinds = {j["type"] for j in jobs if j.get("type") in ("image", "video", "tts")}
+    if pictures:
+        kinds.add("image")
+    return tuple(sorted(kinds)) or ("video",)
+
+
+def select_batch(args, manifest):
+    args.jobs = manifest["jobs"]
+    args.with_pictures = (getattr(args, "with_pictures", False) or manifest.get("install_pictures", False)
+                          or any(j["type"] == "image" for j in args.jobs))
+
+
+def missing_nodes(c, pictures=False, kinds=None):
+    """Node classes this batch will post must be known to this ComfyUI."""
     try:
         known = set(get(c.url + "/object_info", timeout=60))
     except Exception:
         return ["（讀不到 /object_info）"]
-    want = set(h3graph.required_classes(pictures))
-    tts = json.loads((SKILL / "workflows" / "h3_tts32_api.json").read_text(encoding="utf-8"))
-    want |= {n["class_type"] for n in tts.values() if isinstance(n, dict) and "class_type" in n}
-    return sorted(want - known)
+    if kinds is None:
+        kinds = ("image", "video", "tts") if pictures else ("video", "tts")
+    return sorted(set(h3graph.required_classes(pictures, kinds=kinds)) - known)
 
 
 # ---------------------------------------------------------------- check / setup
@@ -173,14 +184,15 @@ def check(args, quiet=False):
     if miss:
         ok = False
         print(f"❌ 少 {len(miss)} 個模型：" + "、".join(Path(f).name for _, f, _ in miss))
-    nodes = missing_nodes(c, args.with_pictures)
+    nodes = missing_nodes(c, args.with_pictures, kinds=node_kinds(getattr(args, "jobs", None), args.with_pictures))
     if nodes:
         ok = False
         print("❌ ComfyUI 不認得這些節點：" + "、".join(nodes))
         print("   （節點組沒裝、裝了還沒重開 ComfyUI，或 ComfyUI Desktop 太舊：先更新到最新版）")
     if not shutil.which("ffmpeg"):
         print("⚠️ 這台電腦找不到 ffmpeg：延伸影片、參考影片需要它（配音會改交 FLAC）。安裝：winget install ffmpeg")
-    print("✅ 可以開始生成" if ok else "→ 執行 `python h3local.py setup`，照它說的做完、重開 ComfyUI Desktop，再 check 一次")
+    manifest_note = "（帶同一份 --manifest）" if getattr(args, "manifest", None) else ""
+    print("✅ 可以開始生成" if ok else f"→ 執行 `python h3local.py setup`{manifest_note}，照它說的做完、重開 ComfyUI Desktop，再 check 一次")
     return c, ok
 
 
@@ -245,7 +257,8 @@ def setup(args):
             if (d / "requirements.txt").is_file():
                 print(f"     \"{c.python()}\" -m pip install -r \"{d / 'requirements.txt'}\"")
         print("  2. 重新啟動 ComfyUI Desktop")
-        print("  3. python h3local.py check")
+        manifest_note = "（帶同一份 --manifest）" if getattr(args, "manifest", None) else ""
+        print(f"  3. python h3local.py check{manifest_note}")
 
 
 # ---------------------------------------------------------------- run
@@ -259,9 +272,7 @@ def run(args):
     print("這一批：" + spec_summary(m, "local"))
     if len(vids) >= 2 and not args.confirmed:
         sys.exit("兩支以上的影片：先把上面這行規格給使用者確認，確認後加 --confirmed 再跑")
-    pictures = any(j["type"] == "image" for j in m["jobs"])
-    args.with_pictures = pictures
-    args.jobs = m["jobs"]  # check only what this batch uses (model_set decides default／official files)
+    select_batch(args, m)
     c, ok = check(args)
     if not ok:
         sys.exit(1)
@@ -276,7 +287,7 @@ def run(args):
                 (work / "inputs" / f).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy(base / f, work / "inputs" / f)
     (work / "manifest.json").write_text(json.dumps(m, ensure_ascii=False, indent=1), encoding="utf-8")
-    for f in ("h3_tts32_api.json", "h3_video_api.json", "h3_picture_api.json"):  # posted to ComfyUI as they are
+    for f in ("h3_tts32_api.json", "h3_video_api.json", "h3_image_api.json"):  # posted to ComfyUI as they are
         shutil.copy(SKILL / "workflows" / f, work / f)
 
     env = dict(ENV, H3JOB_LOCAL_TEST="1", H3JOB_FETCH="1", H3JOB_DIR=str(work), H3JOB_COMFY_URL=c.url,
@@ -324,18 +335,25 @@ def main():
     ap.add_argument("--comfy-dir", help="ComfyUI 的資料夾（有 input、custom_nodes 的那一層）；Desktop 會自己回報，通常不用填")
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("check")
+    c.add_argument("--manifest", help="只檢查這批工作需要的模型（依 manifest 選擇官方／預設組）")
     c.add_argument("--with-pictures", action="store_true")
     c.add_argument("--with-official", action="store_true")
     c.add_argument("--official-only", action="store_true")
     s = sub.add_parser("setup")
+    s.add_argument("--manifest", help="只下載這批工作需要的模型（依 manifest 選擇官方／預設組）")
     s.add_argument("--with-pictures", action="store_true", help="也下載生圖模型（約多 10 GB）")
     s.add_argument("--with-official", action="store_true", help="也下載 Comfy-Org 官方模型組（model_set: official；Ref2VA＋FL2VA 兩組，約多 48 GB）")
-    s.add_argument("--official-only", action="store_true", help="只用官方模型組：不下載社群主模型、MysticXXX、社群 turbo（不能生圖與配音）")
+    s.add_argument("--official-only", action="store_true", help="不下載社群主模型、MysticXXX、社群 turbo（配音需社群主模型；生圖可另加 --with-pictures）")
     r = sub.add_parser("run")
     r.add_argument("manifest")
     r.add_argument("--confirmed", action="store_true")
     r.add_argument("--force", action="store_true")
     args = ap.parse_args()
+    if args.cmd in ("check", "setup") and args.manifest:
+        if official_flag(args):
+            ap.error("--manifest 依工作選擇模型組，不能與 --with-official 或 --official-only 併用")
+        manifest, _ = load_manifest(args.manifest)
+        select_batch(args, manifest)
     if args.cmd == "check":
         sys.exit(0 if check(args)[1] else 1)
     {"setup": setup, "run": run}[args.cmd](args)
